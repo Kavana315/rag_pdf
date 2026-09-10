@@ -1,70 +1,102 @@
 import os
 import streamlit as st
-
 from dotenv import load_dotenv
-from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
-from langchain_community.document_loaders import PyPDFLoader
+
+from pypdf import PdfReader
+
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
+from langchain_core.documents import Document
 from langchain_core.prompts import PromptTemplate
 
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_google_genai import ChatGoogleGenerativeAI
+
+
+# --------------------------------------------------
+# ENV SETUP (ONLY FOR LLM, NOT EMBEDDINGS)
+# --------------------------------------------------
 load_dotenv()
-
-st.set_page_config(page_title="PDF Chatbot", page_icon="📄")
-st.title("📄 Chat with PDF")
-st.write("Upload a PDF and ask questions about its content.")
-
-api_key = os.getenv("GOOGLE_API_KEY")
-
-if not api_key:
-    st.error("GOOGLE_API_KEY is missing.")
-    st.info(
-        "Create a .env file in the same folder as app.py and add:\n\n"
-        "GOOGLE_API_KEY=your_api_key_here"
-    )
-    st.stop()
+GOOGLE_API_KEY= os.getenv('GOOGLE_API_KEY')
 
 
-@st.cache_resource
-def get_llm():
-    return ChatGoogleGenerativeAI(
-        model="gemini-3.1-flash-lite",
-        temperature=0,
-        google_api_key=api_key,
-    )
+# --------------------------------------------------
+# PDF → TEXT
+# --------------------------------------------------
+def read_pdfs(pdf_files):
+    """
+    Extract text from uploaded PDF files
+    """
+    all_text = ""
+
+    for pdf in pdf_files:
+        reader = PdfReader(pdf)
+        for page in reader.pages:
+            text = page.extract_text()
+            if text:
+                all_text += text
+
+    return all_text
 
 
-@st.cache_resource
-def create_vector_store(file_path):
-    loader = PyPDFLoader(file_path)
-    documents = loader.load()
-
+# --------------------------------------------------
+# TEXT → CHUNKS
+# --------------------------------------------------
+def split_into_chunks(text):
+    """
+    Split large text into overlapping chunks
+    """
     splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,
-        chunk_overlap=150
+        chunk_size=400,
+        chunk_overlap=50
     )
-    chunks = splitter.split_documents(documents)
+    return splitter.split_text(text)
 
-    embeddings = GoogleGenerativeAIEmbeddings(
-        model="models/gemini-embedding-001",
-        google_api_key=api_key,
+
+# --------------------------------------------------
+# BUILD FAISS INDEX (LOCAL EMBEDDINGS)
+# --------------------------------------------------
+def build_faiss_index(chunks):
+    """
+    Create FAISS vector store using local Hugging Face embeddings
+    """
+    embeddings = HuggingFaceEmbeddings(
+        model_name="sentence-transformers/all-MiniLM-L6-v2"
     )
 
-    return FAISS.from_documents(chunks, embeddings)
+    documents = [Document(page_content=chunk) for chunk in chunks]
+
+    vector_store = FAISS.from_documents(documents, embeddings)
+    vector_store.save_local("faiss_index")
 
 
-def answer_question(question, vector_store):
-    docs = vector_store.similarity_search(question, k=4)
-    context = "\n\n".join(doc.page_content for doc in docs)
+# --------------------------------------------------
+# LOAD FAISS INDEX
+# --------------------------------------------------
+def load_faiss_index():
+    embeddings = HuggingFaceEmbeddings(
+        model_name="sentence-transformers/all-MiniLM-L6-v2"
+    )
+    return FAISS.load_local(
+    "faiss_index",
+    embeddings,
+    allow_dangerous_deserialization=True
+)
 
+
+# --------------------------------------------------
+# PROMPT + LLM
+# --------------------------------------------------
+def get_prompt_and_llm():
     prompt_template = """
-You are a helpful assistant answering questions from a PDF.
+You are an AI assistant.
 
-Answer using only the information in the context.
-If the answer is not present, say:
-"I could not find the answer in the uploaded PDF."
+Answer the question using ONLY the context below.
+If the answer is not present in the context, say exactly:
+"The answer is not available in the provided context."
+The answer has to be in bullet point format, each bullet point has to be in away that a clss 10 th grade student understnd the concept, simplify it as much as possible.
+Each bullet point should have maximum 100 words.
 
-Give a clear and concise answer.
 
 Context:
 {context}
@@ -80,40 +112,80 @@ Answer:
         input_variables=["context", "question"]
     )
 
+    llm = ChatGoogleGenerativeAI(
+        model="gemini-3.5-flash-lite",
+        temperature=1.0,
+        google_api_key=GOOGLE_API_KEY
+    )
+
+    return prompt, llm
+
+
+# --------------------------------------------------
+# RAG: QUESTION → ANSWER
+# --------------------------------------------------
+def answer_question(question):
+    """
+    Complete RAG pipeline:
+    Retrieval → Prompt → LLM
+    """
+    vector_store = load_faiss_index()
+
+    # Retrieve top-k relevant chunks
+    docs = vector_store.similarity_search(question, k=10)
+
+    context = "\n\n".join(doc.page_content for doc in docs)
+
+    prompt, llm = get_prompt_and_llm()
     final_prompt = prompt.format(
         context=context,
         question=question
     )
 
-    response = get_llm().invoke(final_prompt)
-
-    # IMPORTANT: return only text, not type/text/extras metadata.
-    return response.text
+    response = llm.invoke(final_prompt)
+    return response.content[0]['text']
 
 
-uploaded_file = st.file_uploader("Upload your PDF", type=["pdf"])
+# --------------------------------------------------
+# STREAMLIT APP
+# --------------------------------------------------
+def main():
+    st.set_page_config(page_title="Chat with PDF (Local Embeddings RAG)")
 
-if uploaded_file:
-    temp_path = "uploaded_document.pdf"
+    st.header("📄 Chat with PDF using RAG (Local Embeddings)")
 
-    with open(temp_path, "wb") as f:
-        f.write(uploaded_file.getbuffer())
+    question = st.text_input("Ask a question from the uploaded PDFs")
 
-    st.success("PDF uploaded successfully.")
-
-    try:
-        vector_store = create_vector_store(temp_path)
-        st.success("PDF processed successfully. You can now ask questions.")
-
-        question = st.text_input("Ask a question about your PDF:")
-
-        if question:
-            with st.spinner("Generating answer..."):
-                answer = answer_question(question, vector_store)
-
+    if question:
+        try:
+            answer = answer_question(question)
             st.subheader("Answer")
             st.write(answer)
+        except Exception as exc:
+            st.error(f"Unable to generate answer: {exc}")
 
-    except Exception as e:
-        st.error("An error occurred while processing the PDF.")
-        st.exception(e)
+    with st.sidebar:
+        st.title("Upload PDFs")
+        pdf_files = st.file_uploader(
+            "Upload one or more PDF files",
+            type=["pdf"],
+            accept_multiple_files=True
+        )
+
+        if st.button("Process PDFs"):
+            if not pdf_files:
+                st.warning("Please upload at least one PDF.")
+                return
+
+            with st.spinner("Reading PDFs and building vector index..."):
+                raw_text = read_pdfs(pdf_files)
+                chunks = split_into_chunks(raw_text)
+
+                # Rebuild the index every time so it reflects the newly uploaded PDFs
+                build_faiss_index(chunks)
+
+            st.success("PDFs processed and indexed successfully!")
+
+
+if __name__ == "__main__":
+    main()
